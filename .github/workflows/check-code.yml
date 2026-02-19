@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
       - name: Install Dependencies
         run: npm clean-install; npm install @microsoft/eslint-formatter-sarif
       - name: Run ESLint
@@ -26,7 +26,7 @@ jobs:
         if: always()
         run: cat lint.sarif
       - name: Upload analysis results to GitHub
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4.32.3
         if: always()
         with:
           sarif_file: lint.sarif
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
       - name: Install Dependencies
         run: npm clean-install
       - name: Build dist/ Directory
@@ -48,7 +48,7 @@ jobs:
             git diff --ignore-space-at-eol --text dist/
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: ${{ failure() && steps.diff.conclusion == 'failure' }}
         with:
           name: dist
@@ -62,7 +62,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
       - name: Install Package
         run: npm clean-install
       - name: Run Jest
@@ -90,7 +90,7 @@ jobs:
     name: GitHub Action (${{ matrix.run.linter }})
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
       - name: Install Dependencies
         run: npm install -g json-diff
       - name: Run Action
