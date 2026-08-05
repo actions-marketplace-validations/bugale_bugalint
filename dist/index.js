@@ -29937,23 +29937,33 @@ exports.generateSarif = generateSarif;
 exports.getKnownParser = getKnownParser;
 exports.getRegexParser = getRegexParser;
 exports.addComments = addComments;
+exports.getPrDiff = getPrDiff;
+exports.parseDiffLines = parseDiffLines;
+exports.isNewIssue = isNewIssue;
+exports.isCommentableIssue = isCommentableIssue;
+exports.filterNewIssues = filterNewIssues;
+exports.failOnIssues = failOnIssues;
 exports.createSummary = createSummary;
 const github_1 = __nccwpck_require__(3228);
 const core_1 = __nccwpck_require__(7484);
 const path_1 = __importDefault(__nccwpck_require__(6928));
 const parse_diff_1 = __importDefault(__nccwpck_require__(2673));
+function normalizeEndLine(line, eline) {
+    return line != null && eline != null && eline < line ? undefined : eline;
+}
 function* parseRegex(input, regex, levelMap) {
     for (const match of input.matchAll(regex)) {
         const groups = match.groups ?? {};
+        const line = groups.line != null ? parseInt(groups.line) : undefined;
         yield {
             id: groups.id,
             sym: groups.sym,
             msg: groups.msg,
             level: levelMap == null ? groups.level : levelMap[groups.level],
             path: groups.path,
-            line: groups.line != null ? parseInt(groups.line) : undefined,
+            line,
             col: groups.col != null ? parseInt(groups.col) : undefined,
-            eline: groups.eline != null ? parseInt(groups.eline) : undefined,
+            eline: normalizeEndLine(line, groups.eline != null ? parseInt(groups.eline) : undefined),
             ecol: groups.ecol != null ? parseInt(groups.ecol) : undefined
         };
     }
@@ -29967,18 +29977,36 @@ function* parsePylint(input) {
         error: 'error'
     };
     for (const issue of JSON.parse(input)) {
+        const line = issue.line;
+        const endLine = issue.endLine;
         yield {
             id: issue['message-id'],
             sym: issue.symbol,
             msg: issue.message,
             level: levelMap[issue.type],
             path: issue.path,
-            line: issue.line,
+            line,
             col: issue.column != null ? issue.column + 1 : undefined,
-            eline: issue.endLine,
+            eline: normalizeEndLine(line, endLine),
             ecol: issue.endColumn != null ? issue.endColumn + 1 : undefined
         };
     }
+}
+function parseSarifFix(result, region) {
+    const replacement = result.fixes?.[0]?.artifactChanges?.[0]?.replacements?.[0];
+    const text = replacement?.insertedContent?.text;
+    if (replacement == null || text == null || region?.startLine == null) {
+        return undefined;
+    }
+    const deleted = replacement.deletedRegion;
+    const endLine = normalizeEndLine(region.startLine, region.endLine) ?? region.startLine;
+    if (deleted.startLine !== region.startLine || (deleted.startColumn ?? 1) !== 1) {
+        return undefined;
+    }
+    if (deleted.endColumn == null) {
+        return (deleted.endLine ?? deleted.startLine) === endLine ? (text === '' ? [] : text.split('\n')) : undefined;
+    }
+    return deleted.endColumn === 1 && deleted.endLine === endLine + 1 ? (text === '' ? [] : text.replace(/\n$/, '').split('\n')) : undefined;
 }
 function* parseSarif(input) {
     const log = JSON.parse(input);
@@ -29987,23 +30015,103 @@ function* parseSarif(input) {
             continue;
         }
         for (const issue of run.results) {
+            const region = issue.locations?.[0]?.physicalLocation?.region;
             yield {
                 id: issue.ruleId,
                 sym: issue.ruleIndex != null ? run.tool.driver.rules?.[issue.ruleIndex]?.name : undefined,
                 msg: issue.message.text,
                 level: issue.level,
                 path: issue.locations?.[0]?.physicalLocation?.artifactLocation?.uri,
-                line: issue.locations?.[0]?.physicalLocation?.region?.startLine,
-                col: issue.locations?.[0]?.physicalLocation?.region?.startColumn,
-                eline: issue.locations?.[0]?.physicalLocation?.region?.endLine,
-                ecol: issue.locations?.[0]?.physicalLocation?.region?.endColumn
+                line: region?.startLine,
+                col: region?.startColumn,
+                eline: normalizeEndLine(region?.startLine, region?.endLine),
+                ecol: region?.endColumn,
+                fix: parseSarifFix(issue, region)
             };
+        }
+    }
+}
+function normalizeDiffLineEndings(diff) {
+    return /^(?:diff --git |@@ ).*\r$/m.test(diff) ? diff.replace(/\r\n/g, '\n') : diff;
+}
+function borrowNeighbor(changes, start, end, fix, range) {
+    const before = changes[start - 1];
+    const after = changes[end];
+    if (before?.type === 'normal') {
+        return { line: before.ln1, eline: range?.eline ?? before.ln1, fix: [before.content.slice(1), ...fix] };
+    }
+    if (after?.type === 'normal') {
+        return { line: range?.line ?? after.ln1, eline: after.ln1, fix: [...fix, after.content.slice(1)] };
+    }
+    return undefined;
+}
+function* parseFormatDiff(input) {
+    for (const file of (0, parse_diff_1.default)(normalizeDiffLineEndings(input))) {
+        const filePath = file.from ?? file.to;
+        if (filePath == null) {
+            continue;
+        }
+        for (const chunk of file.chunks) {
+            const markers = chunk.changes.filter((change) => change.content.startsWith('\\'));
+            const eofNewlineAdded = markers.some((change) => change.type === 'del') && !markers.some((change) => change.type === 'add');
+            const changes = chunk.changes.filter((change) => !change.content.startsWith('\\'));
+            let index = 0;
+            while (index < changes.length) {
+                const start = index;
+                const deleted = [];
+                const inserted = [];
+                while (index < changes.length) {
+                    const change = changes[index];
+                    if (change.type !== 'del') {
+                        break;
+                    }
+                    deleted.push(change);
+                    index++;
+                }
+                while (index < changes.length) {
+                    const change = changes[index];
+                    if (change.type !== 'add') {
+                        break;
+                    }
+                    inserted.push(change.content.slice(1));
+                    index++;
+                }
+                let location;
+                const terminatorAdded = eofNewlineAdded && index >= changes.length;
+                if (deleted.length > 0) {
+                    const line = deleted[0].ln;
+                    const eline = deleted[deleted.length - 1].ln;
+                    const removed = deleted.map((change) => change.content.slice(1));
+                    if (removed.length === inserted.length && removed.every((content, offset) => content === inserted[offset])) {
+                        location = terminatorAdded ? { line, eline, fix: inserted } : { line, eline };
+                    }
+                    else if (inserted.length === 1 && inserted[0] === '') {
+                        location = borrowNeighbor(changes, start, index, inserted, { line, eline }) ?? { line, eline };
+                    }
+                    else {
+                        location = { line, eline, fix: inserted };
+                    }
+                }
+                else if (inserted.length > 0) {
+                    location = borrowNeighbor(changes, start, index, inserted);
+                }
+                else {
+                    index++;
+                }
+                if (location != null) {
+                    if (terminatorAdded && location.fix != null) {
+                        location = { ...location, fix: [...location.fix, ''] };
+                    }
+                    yield { level: 'warning', path: filePath, ...location };
+                }
+            }
         }
     }
 }
 const knownParsers = {
     pylint: parsePylint,
     sarif: parseSarif,
+    diff: parseFormatDiff,
     mypy: (input) => parseRegex(input, /^(?<path>[^:\n]+):(?:(?<line>\d+):)?(?:(?<col>\d+):)?(?:(?<eline>\d+):)?(?:(?<ecol>\d+):)? (?<level>[^:\s]+): (?<msg>.+?)\s*(?:\[(?<id>\S+)\])?$/gm),
     flake8: (input) => parseRegex(input, /^(?<path>[^:\n]+):(?<line>\d+):(?<col>\d+): (?<id>\w\d+) (?<msg>[^\n]+)$/gm),
     mdl: (input) => parseRegex(input, /^(?<path>[^:\n]+)(?::(?<line>\d+))?(?::(?<col>\d+))? (?<id>[^/\n]+)\/(?<sym>[^\s]+) (?<msg>[^\n]+)$/gm),
@@ -30022,6 +30130,12 @@ function normalizePath(givenPath, analysisPath) {
     }
     return path_1.default.relative('.', path_1.default.join(analysisPath, givenPath)).replace(/\\/g, '/');
 }
+function* appendMessage(issues, message) {
+    for (const issue of issues) {
+        const msg = [issue.msg, message].filter((part) => part != null && part !== '').join(' ');
+        yield { ...issue, msg: msg === '' ? undefined : msg };
+    }
+}
 function generateSarif(issues, identifier, analysisPath) {
     const rulesIndices = {};
     const rules = [];
@@ -30031,12 +30145,13 @@ function generateSarif(issues, identifier, analysisPath) {
             rulesIndices[issue.id] = rules.length;
             rules.push({ id: issue.id, name: issue.sym });
         }
+        const uri = issue.path != null ? normalizePath(issue.path, analysisPath) : undefined;
         results.push({
-            message: { text: issue.msg ?? undefined },
+            message: { text: issue.msg ?? '' },
             locations: [
                 {
                     physicalLocation: {
-                        artifactLocation: { uri: issue.path != null ? normalizePath(issue.path, analysisPath) : undefined },
+                        artifactLocation: { uri },
                         region: issue.line != null || issue.col != null || issue.eline != null || issue.ecol != null
                             ? {
                                 startLine: issue.line ?? undefined,
@@ -30048,6 +30163,23 @@ function generateSarif(issues, identifier, analysisPath) {
                     }
                 }
             ],
+            fixes: issue.fix != null && uri != null && issue.line != null
+                ? [
+                    {
+                        artifactChanges: [
+                            {
+                                artifactLocation: { uri },
+                                replacements: [
+                                    {
+                                        deletedRegion: { startLine: issue.line, startColumn: 1, endLine: (issue.eline ?? issue.line) + 1, endColumn: 1 },
+                                        insertedContent: { text: issue.fix.map((line) => `${line}\n`).join('') }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+                : undefined,
             level: issue.level ?? undefined,
             ruleId: issue.id ?? issue.sym ?? undefined,
             ruleIndex: issue.id != null ? rulesIndices[issue.id] : undefined
@@ -30059,17 +30191,26 @@ function generateSarif(issues, identifier, analysisPath) {
         runs: [{ tool: { driver: { name: identifier, rules } }, results }]
     };
 }
-function getKnownParser(identifier) {
+function getKnownParser(identifier, message) {
     const parser = knownParsers[identifier];
     if (parser == null) {
         throw new Error(`Unrecognized: ${identifier}`);
     }
-    return parser;
+    return (input) => appendMessage(parser(input), message);
 }
-function getRegexParser(regex, levelMap) {
-    return (input) => parseRegex(input, regex, levelMap);
+function getRegexParser(regex, message, levelMap) {
+    return (input) => appendMessage(parseRegex(input, regex, levelMap), message);
 }
-async function addComments(issues, githubToken, identifier, owner, repo, prNumber, analysisPath) {
+function buildCommentBody(commentTag, identifier, issue) {
+    const identifiers = `[${[issue.level, identifier, issue.id, issue.sym].filter((n) => n).join(':')}]`;
+    const body = `${commentTag}\n${[issue.msg != null && issue.msg !== '' ? `**${issue.msg}**` : undefined, identifiers].filter((n) => n).join('\n')}`;
+    if (issue.fix == null || (issue.fix.length === 1 && issue.fix[0] === '')) {
+        return body;
+    }
+    const fence = '`'.repeat(Math.max(3, ...Array.from(issue.fix.join('\n').matchAll(/`+/g), (m) => m[0].length + 1)));
+    return `${body}\n${fence}suggestion\n${issue.fix.map((line) => `${line}\n`).join('')}${fence}`;
+}
+async function addComments(issues, prDiff, githubToken, identifier, owner, repo, prNumber, analysisPath) {
     /* eslint camelcase: ["error", {allow: ['^pull_number$', '^comment_id$', '^start_side$', '^start_line$']}] */
     const octokit = (0, github_1.getOctokit)(githubToken);
     (0, core_1.debug)('Deleting old comments');
@@ -30082,40 +30223,12 @@ async function addComments(issues, githubToken, identifier, owner, repo, prNumbe
             }
         }
     }
-    const prDiff = (await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber, mediaType: { format: 'diff' } })).data;
-    const linesSet = {};
-    for (const file of (0, parse_diff_1.default)(prDiff)) {
-        if (file.to == null) {
-            continue;
-        }
-        (0, core_1.debug)(`PR file diff: ${file.to} (${file.chunks.length} chunks)`);
-        linesSet[file.to] = {};
-        for (const chunk of file.chunks) {
-            for (const change of chunk.changes) {
-                if (change.type === 'add') {
-                    linesSet[file.to][change?.ln] = true;
-                }
-            }
-        }
-    }
-    (0, core_1.debug)(`linesSet: ${JSON.stringify(linesSet)}`);
+    const diffLines = parseDiffLines(prDiff);
     const comments = [];
     for (const issue of issues) {
         (0, core_1.debug)(`Processing issue on ${issue.path}:${issue.line}`);
-        if (issue.path == null || issue.line == null) {
-            continue;
-        }
-        const normalized = normalizePath(issue.path, analysisPath);
-        (0, core_1.debug)(`Normalized path: ${normalized}`);
-        if ((() => {
-            for (let line = issue.line; line <= (issue.eline ?? issue.line); line++) {
-                if (!linesSet?.[normalized]?.[line]) {
-                    return true;
-                }
-            }
-            return false;
-        })()) {
-            (0, core_1.debug)(`Skipping issue on ${normalized}:${issue.line} because it's not in the PR diff`);
+        if (!isCommentableIssue(issue, diffLines, analysisPath)) {
+            (0, core_1.debug)(`Skipping issue on ${issue.path}:${issue.line} because it is not on lines the pull request diff shows`);
             continue;
         }
         if (comments.length >= 50) {
@@ -30124,12 +30237,12 @@ async function addComments(issues, githubToken, identifier, owner, repo, prNumbe
         }
         const endLine = issue.eline ?? issue.line;
         const args = {
-            path: normalized,
+            path: normalizePath(issue.path, analysisPath),
             side: 'RIGHT',
             start_side: 'RIGHT',
             line: endLine,
             start_line: endLine === issue.line ? undefined : issue.line,
-            body: `${commentTag}\n**${issue.msg}**\n[${[issue.level, identifier, issue.id, issue.sym].filter((n) => n).join(':')}]`
+            body: buildCommentBody(commentTag, identifier, issue)
         };
         (0, core_1.debug)(`Generating comment ${JSON.stringify(args)}`);
         comments.push(args);
@@ -30141,6 +30254,72 @@ async function addComments(issues, githubToken, identifier, owner, repo, prNumbe
     (0, core_1.debug)('Sending comments');
     await octokit.rest.pulls.createReview({ owner, repo, pull_number: prNumber, event: 'COMMENT', comments });
     (0, core_1.debug)('Sent comments');
+}
+function decodeDiff(data) {
+    if (typeof data === 'string') {
+        return data;
+    }
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+        return new TextDecoder().decode(data);
+    }
+    throw new Error(`The pull request diff was returned as ${typeof data} rather than text, so no issue can be matched against the pull request`);
+}
+async function getPrDiff(githubToken, owner, repo, prNumber) {
+    const octokit = (0, github_1.getOctokit)(githubToken);
+    return decodeDiff((await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber, mediaType: { format: 'diff' } })).data);
+}
+function parseDiffLines(diff) {
+    const diffLines = {};
+    const files = (0, parse_diff_1.default)(diff);
+    if (files.length === 0 && diff.length > 0) {
+        throw new Error('The pull request diff is not empty but no file could be parsed from it, so no issue can be matched against the pull request');
+    }
+    for (const file of files) {
+        if (file.to == null) {
+            continue;
+        }
+        (0, core_1.debug)(`PR file diff: ${file.to} (${file.chunks.length} chunks)`);
+        diffLines[file.to] = {};
+        for (const chunk of file.chunks) {
+            for (const change of chunk.changes) {
+                if (change.type === 'add') {
+                    diffLines[file.to][change.ln] = true;
+                }
+                else if (change.type === 'normal') {
+                    diffLines[file.to][change.ln2] = false;
+                }
+            }
+        }
+    }
+    (0, core_1.debug)(`diffLines: ${JSON.stringify(diffLines)}`);
+    return diffLines;
+}
+function issueLines(line, eline) {
+    return Array.from({ length: (eline ?? line) - line + 1 }, (_, offset) => line + offset);
+}
+function isNewIssue(issue, diffLines, analysisPath) {
+    if (issue.path == null || issue.line == null) {
+        return false;
+    }
+    const lines = diffLines[normalizePath(issue.path, analysisPath)];
+    return issueLines(issue.line, issue.eline).some((line) => lines?.[line] ?? false);
+}
+function isCommentableIssue(issue, diffLines, analysisPath) {
+    if (!isNewIssue(issue, diffLines, analysisPath)) {
+        return false;
+    }
+    const lines = diffLines[normalizePath(issue.path, analysisPath)];
+    return issueLines(issue.line, issue.eline).every((line) => lines?.[line] != null);
+}
+function filterNewIssues(issues, prDiff, analysisPath) {
+    const diffLines = parseDiffLines(prDiff);
+    return [...issues].filter((issue) => isNewIssue(issue, diffLines, analysisPath));
+}
+function failOnIssues(issues, toolName) {
+    const failing = [...issues];
+    if (failing.length > 0) {
+        throw new Error(`${toolName} found ${failing.length} issues`);
+    }
 }
 async function createSummary(issues, identifier, analysisPath) {
     const table = [
@@ -30168,7 +30347,9 @@ async function createSummary(issues, identifier, analysisPath) {
     await core_1.summary.write();
 }
 exports._testExports = {
-    normalizePath
+    normalizePath,
+    buildCommentBody,
+    decodeDiff
 };
 
 
@@ -32097,38 +32278,59 @@ const fs_1 = __nccwpck_require__(9896);
 const github_1 = __nccwpck_require__(3228);
 const core_1 = __nccwpck_require__(7484);
 const bugalint_1 = __nccwpck_require__(8983);
+function getParser(inputFormat, inputRegex, levelMap, message) {
+    if (inputFormat === '') {
+        return (0, bugalint_1.getRegexParser)(new RegExp(inputRegex, 'gm'), message, levelMap === '' ? undefined : JSON.parse(levelMap));
+    }
+    return (0, bugalint_1.getKnownParser)(inputFormat, message);
+}
 async function run() {
     try {
         const inputFile = (0, core_1.getInput)('inputFile');
-        const sarif = (0, core_1.getBooleanInput)('sarif');
+        const sarif = (0, core_1.getInput)('sarif');
         const comment = (0, core_1.getBooleanInput)('comment');
         const summary = (0, core_1.getBooleanInput)('summary');
-        const outputFile = (0, core_1.getInput)('outputFile');
+        const fail = (0, core_1.getBooleanInput)('fail');
+        const onlyNew = (0, core_1.getBooleanInput)('onlyNew');
         const toolName = (0, core_1.getInput)('toolName');
         const inputFormat = (0, core_1.getInput)('inputFormat');
         const inputRegex = (0, core_1.getInput)('inputRegex');
         const levelMap = (0, core_1.getInput)('levelMap');
         const analysisPath = (0, core_1.getInput)('analysisPath');
         const githubToken = (0, core_1.getInput)('githubToken');
-        const parser = inputFormat === ''
-            ? (0, bugalint_1.getRegexParser)(new RegExp(inputRegex, 'gm'), levelMap === '' ? undefined : JSON.parse(levelMap))
-            : (0, bugalint_1.getKnownParser)(inputFormat);
-        const input = (0, fs_1.readFileSync)(inputFile, 'utf-8').replace(/\r/g, '');
+        const message = (0, core_1.getInput)('message');
+        const parser = getParser(inputFormat, inputRegex, levelMap, message);
+        const raw = (0, fs_1.readFileSync)(inputFile, 'utf-8');
+        const input = inputFormat === 'diff' ? raw : raw.replace(/\r/g, '');
         (0, core_1.debug)(`input: ${input}`);
-        if (sarif) {
-            const output = (0, bugalint_1.generateSarif)(parser(input), toolName, analysisPath);
-            (0, core_1.debug)(`SARIF output: ${JSON.stringify(output, null, 2)}`);
-            (0, fs_1.writeFileSync)(outputFile, JSON.stringify(output));
-        }
-        if (comment) {
-            const prNumber = github_1.context.payload.pull_request?.number;
+        const prNumber = github_1.context.payload.pull_request?.number;
+        let pullRequest;
+        const getPullRequest = async () => {
             if (prNumber == null) {
                 throw new Error('No pull request number found.');
             }
-            await (0, bugalint_1.addComments)(parser(input), githubToken, toolName, github_1.context.repo.owner, github_1.context.repo.repo, prNumber, analysisPath);
+            pullRequest ??= [prNumber, await (0, bugalint_1.getPrDiff)(githubToken, github_1.context.repo.owner, github_1.context.repo.repo, prNumber)];
+            return pullRequest;
+        };
+        let issues = [...parser(input)];
+        if (onlyNew) {
+            const [, prDiff] = await getPullRequest();
+            issues = (0, bugalint_1.filterNewIssues)(issues, prDiff, analysisPath);
+        }
+        const output = (0, bugalint_1.generateSarif)(issues, toolName, analysisPath);
+        (0, core_1.info)(`SARIF output: ${JSON.stringify(output, null, 2)}`);
+        if (sarif !== '') {
+            (0, fs_1.writeFileSync)(sarif, JSON.stringify(output));
+        }
+        if (comment) {
+            const [pullNumber, prDiff] = await getPullRequest();
+            await (0, bugalint_1.addComments)(issues, prDiff, githubToken, toolName, github_1.context.repo.owner, github_1.context.repo.repo, pullNumber, analysisPath);
         }
         if (summary) {
-            await (0, bugalint_1.createSummary)(parser(input), toolName, analysisPath);
+            await (0, bugalint_1.createSummary)(issues, toolName, analysisPath);
+        }
+        if (fail) {
+            (0, bugalint_1.failOnIssues)(issues, toolName);
         }
     }
     catch (error) {

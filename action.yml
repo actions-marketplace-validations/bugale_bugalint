@@ -6,9 +6,9 @@ inputs:
     description: 'Path to the file with the linter output'
     required: true
   sarif:
-    description: 'Should the action create a SARIF file'
+    description: 'Path to the SARIF file this action will generate. Set to an empty string to not write a file'
     required: false
-    default: 'true'
+    default: 'sarif.json'
   comment:
     description: 'Should the action comment on the PR'
     required: false
@@ -17,10 +17,14 @@ inputs:
     description: 'Should the action create a markdown summary'
     required: false
     default: 'true'
-  outputFile:
-    description: 'Path to the SARIF file this action will generate'
+  fail:
+    description: 'Should the action fail the step if issues are found'
     required: false
-    default: 'sarif.json'
+    default: 'true'
+  onlyNew:
+    description: 'Should the action consider only issues found on lines added in the pull request, ignoring all others everywhere'
+    required: false
+    default: 'false'
   toolName:
     description: 'Name of the tool to be written in the SARIF'
     required: true
@@ -40,6 +44,10 @@ inputs:
     description: "The path at which the analysis took place relative to the repository's root. Used to relativize any paths to the repository root path."
     required: false
     default: '.'
+  message:
+    description: 'Additional message to append to every issue found. The only message of formats that do not carry one, such as diff'
+    required: false
+    default: ''
   githubToken:
     description: 'Github token of the repository (automatically created by Github)'
     default: ${{ github.token }}

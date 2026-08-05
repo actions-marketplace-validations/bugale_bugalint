@@ -1,4 +1,4 @@
-import type { Log, ReportingDescriptor, Result } from 'sarif'
+import type { Log, Region, ReportingDescriptor, Result } from 'sarif'
 import { getOctokit } from '@actions/github'
 import { debug, warning, summary } from '@actions/core'
 import path from 'path'
@@ -15,22 +15,28 @@ interface Issue {
   col?: number
   eline?: number
   ecol?: number
+  fix?: string[]
 }
 
 export type Parser = (input: string) => Generator<Issue>
 
+function normalizeEndLine(line?: number, eline?: number): number | undefined {
+  return line != null && eline != null && eline < line ? undefined : eline
+}
+
 function* parseRegex(input: string, regex: RegExp, levelMap?: Record<string, Result.level>): Generator<Issue> {
   for (const match of input.matchAll(regex)) {
     const groups = match.groups ?? {}
+    const line = groups.line != null ? parseInt(groups.line) : undefined
     yield {
       id: groups.id,
       sym: groups.sym,
       msg: groups.msg,
       level: levelMap == null ? (groups.level as Result.level) : levelMap[groups.level],
       path: groups.path,
-      line: groups.line != null ? parseInt(groups.line) : undefined,
+      line,
       col: groups.col != null ? parseInt(groups.col) : undefined,
-      eline: groups.eline != null ? parseInt(groups.eline) : undefined,
+      eline: normalizeEndLine(line, groups.eline != null ? parseInt(groups.eline) : undefined),
       ecol: groups.ecol != null ? parseInt(groups.ecol) : undefined
     }
   }
@@ -45,18 +51,37 @@ function* parsePylint(input: string): Generator<Issue> {
     error: 'error'
   }
   for (const issue of JSON.parse(input)) {
+    const line: number | undefined = issue.line
+    const endLine: number | undefined = issue.endLine
     yield {
       id: issue['message-id'],
       sym: issue.symbol,
       msg: issue.message,
       level: levelMap[issue.type],
       path: issue.path,
-      line: issue.line,
+      line,
       col: issue.column != null ? issue.column + 1 : undefined,
-      eline: issue.endLine,
+      eline: normalizeEndLine(line, endLine),
       ecol: issue.endColumn != null ? issue.endColumn + 1 : undefined
     }
   }
+}
+
+function parseSarifFix(result: Result, region?: Region): string[] | undefined {
+  const replacement = result.fixes?.[0]?.artifactChanges?.[0]?.replacements?.[0]
+  const text = replacement?.insertedContent?.text
+  if (replacement == null || text == null || region?.startLine == null) {
+    return undefined
+  }
+  const deleted = replacement.deletedRegion
+  const endLine = normalizeEndLine(region.startLine, region.endLine) ?? region.startLine
+  if (deleted.startLine !== region.startLine || (deleted.startColumn ?? 1) !== 1) {
+    return undefined
+  }
+  if (deleted.endColumn == null) {
+    return (deleted.endLine ?? deleted.startLine) === endLine ? (text === '' ? [] : text.split('\n')) : undefined
+  }
+  return deleted.endColumn === 1 && deleted.endLine === endLine + 1 ? (text === '' ? [] : text.replace(/\n$/, '').split('\n')) : undefined
 }
 
 function* parseSarif(input: string): Generator<Issue> {
@@ -66,16 +91,100 @@ function* parseSarif(input: string): Generator<Issue> {
       continue
     }
     for (const issue of run.results) {
+      const region = issue.locations?.[0]?.physicalLocation?.region
       yield {
         id: issue.ruleId,
         sym: issue.ruleIndex != null ? run.tool.driver.rules?.[issue.ruleIndex]?.name : undefined,
         msg: issue.message.text,
         level: issue.level,
         path: issue.locations?.[0]?.physicalLocation?.artifactLocation?.uri,
-        line: issue.locations?.[0]?.physicalLocation?.region?.startLine,
-        col: issue.locations?.[0]?.physicalLocation?.region?.startColumn,
-        eline: issue.locations?.[0]?.physicalLocation?.region?.endLine,
-        ecol: issue.locations?.[0]?.physicalLocation?.region?.endColumn
+        line: region?.startLine,
+        col: region?.startColumn,
+        eline: normalizeEndLine(region?.startLine, region?.endLine),
+        ecol: region?.endColumn,
+        fix: parseSarifFix(issue, region)
+      }
+    }
+  }
+}
+
+function normalizeDiffLineEndings(diff: string): string {
+  return /^(?:diff --git |@@ ).*\r$/m.test(diff) ? diff.replace(/\r\n/g, '\n') : diff
+}
+
+function borrowNeighbor(
+  changes: parseDiff.Change[],
+  start: number,
+  end: number,
+  fix: string[],
+  range?: Pick<Issue, 'line' | 'eline'>
+): Pick<Issue, 'line' | 'eline' | 'fix'> | undefined {
+  const before = changes[start - 1]
+  const after = changes[end]
+  if (before?.type === 'normal') {
+    return { line: before.ln1, eline: range?.eline ?? before.ln1, fix: [before.content.slice(1), ...fix] }
+  }
+  if (after?.type === 'normal') {
+    return { line: range?.line ?? after.ln1, eline: after.ln1, fix: [...fix, after.content.slice(1)] }
+  }
+  return undefined
+}
+
+function* parseFormatDiff(input: string): Generator<Issue> {
+  for (const file of parseDiff(normalizeDiffLineEndings(input))) {
+    const filePath = file.from ?? file.to
+    if (filePath == null) {
+      continue
+    }
+    for (const chunk of file.chunks) {
+      const markers = chunk.changes.filter((change) => change.content.startsWith('\\'))
+      const eofNewlineAdded = markers.some((change) => change.type === 'del') && !markers.some((change) => change.type === 'add')
+      const changes = chunk.changes.filter((change) => !change.content.startsWith('\\'))
+      let index = 0
+      while (index < changes.length) {
+        const start = index
+        const deleted: parseDiff.DeleteChange[] = []
+        const inserted: string[] = []
+        while (index < changes.length) {
+          const change = changes[index]
+          if (change.type !== 'del') {
+            break
+          }
+          deleted.push(change)
+          index++
+        }
+        while (index < changes.length) {
+          const change = changes[index]
+          if (change.type !== 'add') {
+            break
+          }
+          inserted.push(change.content.slice(1))
+          index++
+        }
+        let location: Pick<Issue, 'line' | 'eline' | 'fix'> | undefined
+        const terminatorAdded = eofNewlineAdded && index >= changes.length
+        if (deleted.length > 0) {
+          const line = deleted[0].ln
+          const eline = deleted[deleted.length - 1].ln
+          const removed = deleted.map((change) => change.content.slice(1))
+          if (removed.length === inserted.length && removed.every((content, offset) => content === inserted[offset])) {
+            location = terminatorAdded ? { line, eline, fix: inserted } : { line, eline }
+          } else if (inserted.length === 1 && inserted[0] === '') {
+            location = borrowNeighbor(changes, start, index, inserted, { line, eline }) ?? { line, eline }
+          } else {
+            location = { line, eline, fix: inserted }
+          }
+        } else if (inserted.length > 0) {
+          location = borrowNeighbor(changes, start, index, inserted)
+        } else {
+          index++
+        }
+        if (location != null) {
+          if (terminatorAdded && location.fix != null) {
+            location = { ...location, fix: [...location.fix, ''] }
+          }
+          yield { level: 'warning', path: filePath, ...location }
+        }
       }
     }
   }
@@ -84,6 +193,7 @@ function* parseSarif(input: string): Generator<Issue> {
 const knownParsers: Record<string, Parser> = {
   pylint: parsePylint,
   sarif: parseSarif,
+  diff: parseFormatDiff,
   mypy: (input: string) =>
     parseRegex(
       input,
@@ -109,6 +219,13 @@ function normalizePath(givenPath: string, analysisPath: string): string {
   return path.relative('.', path.join(analysisPath, givenPath)).replace(/\\/g, '/')
 }
 
+function* appendMessage(issues: Generator<Issue>, message: string): Generator<Issue> {
+  for (const issue of issues) {
+    const msg = [issue.msg, message].filter((part) => part != null && part !== '').join(' ')
+    yield { ...issue, msg: msg === '' ? undefined : msg }
+  }
+}
+
 export function generateSarif(issues: Iterable<Issue>, identifier: string, analysisPath: string): Log {
   const rulesIndices: Record<string, number> = {}
   const rules: ReportingDescriptor[] = []
@@ -119,12 +236,13 @@ export function generateSarif(issues: Iterable<Issue>, identifier: string, analy
       rulesIndices[issue.id] = rules.length
       rules.push({ id: issue.id, name: issue.sym })
     }
+    const uri = issue.path != null ? normalizePath(issue.path, analysisPath) : undefined
     results.push({
-      message: { text: issue.msg ?? undefined },
+      message: { text: issue.msg ?? '' },
       locations: [
         {
           physicalLocation: {
-            artifactLocation: { uri: issue.path != null ? normalizePath(issue.path, analysisPath) : undefined },
+            artifactLocation: { uri },
             region:
               issue.line != null || issue.col != null || issue.eline != null || issue.ecol != null
                 ? {
@@ -137,6 +255,24 @@ export function generateSarif(issues: Iterable<Issue>, identifier: string, analy
           }
         }
       ],
+      fixes:
+        issue.fix != null && uri != null && issue.line != null
+          ? [
+              {
+                artifactChanges: [
+                  {
+                    artifactLocation: { uri },
+                    replacements: [
+                      {
+                        deletedRegion: { startLine: issue.line, startColumn: 1, endLine: (issue.eline ?? issue.line) + 1, endColumn: 1 },
+                        insertedContent: { text: issue.fix.map((line) => `${line}\n`).join('') }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          : undefined,
       level: issue.level ?? undefined,
       ruleId: issue.id ?? issue.sym ?? undefined,
       ruleIndex: issue.id != null ? rulesIndices[issue.id] : undefined
@@ -149,20 +285,31 @@ export function generateSarif(issues: Iterable<Issue>, identifier: string, analy
   }
 }
 
-export function getKnownParser(identifier: string): Parser {
+export function getKnownParser(identifier: string, message: string): Parser {
   const parser = knownParsers[identifier]
   if (parser == null) {
     throw new Error(`Unrecognized: ${identifier}`)
   }
-  return parser
+  return (input: string) => appendMessage(parser(input), message)
 }
 
-export function getRegexParser(regex: RegExp, levelMap?: Record<string, Result.level>): Parser {
-  return (input: string) => parseRegex(input, regex, levelMap)
+export function getRegexParser(regex: RegExp, message: string, levelMap?: Record<string, Result.level>): Parser {
+  return (input: string) => appendMessage(parseRegex(input, regex, levelMap), message)
+}
+
+function buildCommentBody(commentTag: string, identifier: string, issue: Issue): string {
+  const identifiers = `[${[issue.level, identifier, issue.id, issue.sym].filter((n) => n).join(':')}]`
+  const body = `${commentTag}\n${[issue.msg != null && issue.msg !== '' ? `**${issue.msg}**` : undefined, identifiers].filter((n) => n).join('\n')}`
+  if (issue.fix == null || (issue.fix.length === 1 && issue.fix[0] === '')) {
+    return body
+  }
+  const fence = '`'.repeat(Math.max(3, ...Array.from(issue.fix.join('\n').matchAll(/`+/g), (m) => m[0].length + 1)))
+  return `${body}\n${fence}suggestion\n${issue.fix.map((line) => `${line}\n`).join('')}${fence}`
 }
 
 export async function addComments(
   issues: Iterable<Issue>,
+  prDiff: string,
   githubToken: string,
   identifier: string,
   owner: string,
@@ -184,45 +331,13 @@ export async function addComments(
     }
   }
 
-  const prDiff = (await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber, mediaType: { format: 'diff' } })).data as unknown as string
-  const linesSet: Record<string, Record<number, boolean>> = {}
-  for (const file of parseDiff(prDiff)) {
-    if (file.to == null) {
-      continue
-    }
-    debug(`PR file diff: ${file.to} (${file.chunks.length} chunks)`)
-    linesSet[file.to] = {}
-    for (const chunk of file.chunks) {
-      for (const change of chunk.changes) {
-        if (change.type === 'add') {
-          linesSet[file.to][change?.ln] = true
-        }
-      }
-    }
-  }
-  debug(`linesSet: ${JSON.stringify(linesSet)}`)
+  const diffLines = parseDiffLines(prDiff)
 
   const comments = []
   for (const issue of issues) {
     debug(`Processing issue on ${issue.path}:${issue.line}`)
-    if (issue.path == null || issue.line == null) {
-      continue
-    }
-
-    const normalized = normalizePath(issue.path, analysisPath)
-    debug(`Normalized path: ${normalized}`)
-
-    if (
-      (() => {
-        for (let line = issue.line; line <= (issue.eline ?? issue.line); line++) {
-          if (!linesSet?.[normalized]?.[line]) {
-            return true
-          }
-        }
-        return false
-      })()
-    ) {
-      debug(`Skipping issue on ${normalized}:${issue.line} because it's not in the PR diff`)
+    if (!isCommentableIssue(issue, diffLines, analysisPath)) {
+      debug(`Skipping issue on ${issue.path}:${issue.line} because it is not on lines the pull request diff shows`)
       continue
     }
     if (comments.length >= 50) {
@@ -232,12 +347,12 @@ export async function addComments(
 
     const endLine = issue.eline ?? issue.line
     const args = {
-      path: normalized,
+      path: normalizePath(issue.path, analysisPath),
       side: 'RIGHT',
       start_side: 'RIGHT',
       line: endLine,
       start_line: endLine === issue.line ? undefined : issue.line,
-      body: `${commentTag}\n**${issue.msg}**\n[${[issue.level, identifier, issue.id, issue.sym].filter((n) => n).join(':')}]`
+      body: buildCommentBody(commentTag, identifier, issue)
     }
     debug(`Generating comment ${JSON.stringify(args)}`)
     comments.push(args)
@@ -249,6 +364,81 @@ export async function addComments(
   debug('Sending comments')
   await octokit.rest.pulls.createReview({ owner, repo, pull_number: prNumber, event: 'COMMENT', comments })
   debug('Sent comments')
+}
+
+export type DiffLines = Record<string, Record<number, boolean>>
+
+function decodeDiff(data: unknown): string {
+  if (typeof data === 'string') {
+    return data
+  }
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+    return new TextDecoder().decode(data)
+  }
+  throw new Error(`The pull request diff was returned as ${typeof data} rather than text, so no issue can be matched against the pull request`)
+}
+
+export async function getPrDiff(githubToken: string, owner: string, repo: string, prNumber: number): Promise<string> {
+  const octokit = getOctokit(githubToken)
+  return decodeDiff((await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber, mediaType: { format: 'diff' } })).data)
+}
+
+export function parseDiffLines(diff: string): DiffLines {
+  const diffLines: DiffLines = {}
+  const files = parseDiff(diff)
+  if (files.length === 0 && diff.length > 0) {
+    throw new Error('The pull request diff is not empty but no file could be parsed from it, so no issue can be matched against the pull request')
+  }
+  for (const file of files) {
+    if (file.to == null) {
+      continue
+    }
+    debug(`PR file diff: ${file.to} (${file.chunks.length} chunks)`)
+    diffLines[file.to] = {}
+    for (const chunk of file.chunks) {
+      for (const change of chunk.changes) {
+        if (change.type === 'add') {
+          diffLines[file.to][change.ln] = true
+        } else if (change.type === 'normal') {
+          diffLines[file.to][change.ln2] = false
+        }
+      }
+    }
+  }
+  debug(`diffLines: ${JSON.stringify(diffLines)}`)
+  return diffLines
+}
+
+function issueLines(line: number, eline?: number): number[] {
+  return Array.from({ length: (eline ?? line) - line + 1 }, (_, offset) => line + offset)
+}
+
+export function isNewIssue(issue: Issue, diffLines: DiffLines, analysisPath: string): issue is Issue & Required<Pick<Issue, 'path' | 'line'>> {
+  if (issue.path == null || issue.line == null) {
+    return false
+  }
+  const lines: Record<number, boolean> | undefined = diffLines[normalizePath(issue.path, analysisPath)]
+  return issueLines(issue.line, issue.eline).some((line) => lines?.[line] ?? false)
+}
+
+export function isCommentableIssue(issue: Issue, diffLines: DiffLines, analysisPath: string): issue is Issue & Required<Pick<Issue, 'path' | 'line'>> {
+  if (!isNewIssue(issue, diffLines, analysisPath)) {
+    return false
+  }
+  const lines: Record<number, boolean> | undefined = diffLines[normalizePath(issue.path, analysisPath)]
+  return issueLines(issue.line, issue.eline).every((line) => lines?.[line] != null)
+}
+
+export function filterNewIssues(issues: Iterable<Issue>, prDiff: string, analysisPath: string): Issue[] {
+  const diffLines = parseDiffLines(prDiff)
+  return [...issues].filter((issue) => isNewIssue(issue, diffLines, analysisPath))
+}
+
+export function failOnIssues(issues: Iterable<Issue>, toolName: string): void {
+  const failing = [...issues]
+  if (failing.length > 0) {
+    throw new Error(`${toolName} found ${failing.length} issues`)
+  }
 }
 
 export async function createSummary(issues: Iterable<Issue>, identifier: string, analysisPath: string): Promise<void> {
@@ -277,5 +467,7 @@ export async function createSummary(issues: Iterable<Issue>, identifier: string,
 }
 
 export const _testExports = {
-  normalizePath
+  normalizePath,
+  buildCommentBody,
+  decodeDiff
 }
