@@ -29940,7 +29940,7 @@ exports.addComments = addComments;
 exports.getPrDiff = getPrDiff;
 exports.parseDiffLines = parseDiffLines;
 exports.isNewIssue = isNewIssue;
-exports.isCommentableIssue = isCommentableIssue;
+exports.getCommentAnchor = getCommentAnchor;
 exports.filterNewIssues = filterNewIssues;
 exports.failOnIssues = failOnIssues;
 exports.createSummary = createSummary;
@@ -30201,14 +30201,19 @@ function getKnownParser(identifier, message) {
 function getRegexParser(regex, message, levelMap) {
     return (input) => appendMessage(parseRegex(input, regex, levelMap), message);
 }
-function buildCommentBody(commentTag, identifier, issue) {
+function buildCommentBody(commentTag, identifier, issue, partial = false) {
     const identifiers = `[${[issue.level, identifier, issue.id, issue.sym].filter((n) => n).join(':')}]`;
     const body = `${commentTag}\n${[issue.msg != null && issue.msg !== '' ? `**${issue.msg}**` : undefined, identifiers].filter((n) => n).join('\n')}`;
     if (issue.fix == null || (issue.fix.length === 1 && issue.fix[0] === '')) {
         return body;
     }
     const fence = '`'.repeat(Math.max(3, ...Array.from(issue.fix.join('\n').matchAll(/`+/g), (m) => m[0].length + 1)));
-    return `${body}\n${fence}suggestion\n${issue.fix.map((line) => `${line}\n`).join('')}${fence}`;
+    const fix = issue.fix.map((line) => `${line}\n`).join('');
+    if (!partial) {
+        return `${body}\n${fence}suggestion\n${fix}${fence}`;
+    }
+    const note = `The pull request diff does not show all of lines ${issue.line}-${issue.eline ?? issue.line}, so this replacement cannot be offered as a suggestion:`;
+    return `${body}\n${note}\n${fence}\n${fix}${fence}`;
 }
 async function addComments(issues, prDiff, githubToken, identifier, owner, repo, prNumber, analysisPath) {
     /* eslint camelcase: ["error", {allow: ['^pull_number$', '^comment_id$', '^start_side$', '^start_line$']}] */
@@ -30227,22 +30232,22 @@ async function addComments(issues, prDiff, githubToken, identifier, owner, repo,
     const comments = [];
     for (const issue of issues) {
         (0, core_1.debug)(`Processing issue on ${issue.path}:${issue.line}`);
-        if (!isCommentableIssue(issue, diffLines, analysisPath)) {
-            (0, core_1.debug)(`Skipping issue on ${issue.path}:${issue.line} because it is not on lines the pull request diff shows`);
+        const anchor = getCommentAnchor(issue, diffLines, analysisPath);
+        if (anchor == null) {
+            (0, core_1.debug)(`Skipping issue on ${issue.path}:${issue.line} because it is not on lines the pull request adds`);
             continue;
         }
         if (comments.length >= 50) {
             (0, core_1.warning)('More than 50 comments detected. Only the first 50 will be posted.');
             break;
         }
-        const endLine = issue.eline ?? issue.line;
         const args = {
-            path: normalizePath(issue.path, analysisPath),
+            path: anchor.path,
             side: 'RIGHT',
             start_side: 'RIGHT',
-            line: endLine,
-            start_line: endLine === issue.line ? undefined : issue.line,
-            body: buildCommentBody(commentTag, identifier, issue)
+            line: anchor.eline,
+            start_line: anchor.eline === anchor.line ? undefined : anchor.line,
+            body: buildCommentBody(commentTag, identifier, issue, anchor.partial)
         };
         (0, core_1.debug)(`Generating comment ${JSON.stringify(args)}`);
         comments.push(args);
@@ -30252,7 +30257,12 @@ async function addComments(issues, prDiff, githubToken, identifier, owner, repo,
         return;
     }
     (0, core_1.debug)('Sending comments');
-    await octokit.rest.pulls.createReview({ owner, repo, pull_number: prNumber, event: 'COMMENT', comments });
+    try {
+        await octokit.rest.pulls.createReview({ owner, repo, pull_number: prNumber, event: 'COMMENT', comments });
+    }
+    catch (error) {
+        (0, core_1.warning)(`Failed to post the comments as a review: ${error instanceof Error ? error.message : String(error)}`);
+    }
     (0, core_1.debug)('Sent comments');
 }
 function decodeDiff(data) {
@@ -30264,9 +30274,14 @@ function decodeDiff(data) {
     }
     throw new Error(`The pull request diff was returned as ${typeof data} rather than text, so no issue can be matched against the pull request`);
 }
-async function getPrDiff(githubToken, owner, repo, prNumber) {
+async function getPrDiff(githubToken, owner, repo) {
     const octokit = (0, github_1.getOctokit)(githubToken);
-    return decodeDiff((await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber, mediaType: { format: 'diff' } })).data);
+    const pr = github_1.context.payload.pull_request;
+    if (pr == null) {
+        throw new Error('No pull request payload found.');
+    }
+    const { base, head } = pr;
+    return decodeDiff((await octokit.rest.repos.compareCommits({ owner, repo, base: base.sha, head: head.sha, mediaType: { format: 'diff' } })).data);
 }
 function parseDiffLines(diff) {
     const diffLines = {};
@@ -30304,12 +30319,30 @@ function isNewIssue(issue, diffLines, analysisPath) {
     const lines = diffLines[normalizePath(issue.path, analysisPath)];
     return issueLines(issue.line, issue.eline).some((line) => lines?.[line] ?? false);
 }
-function isCommentableIssue(issue, diffLines, analysisPath) {
-    if (!isNewIssue(issue, diffLines, analysisPath)) {
-        return false;
+function getCommentAnchor(issue, diffLines, analysisPath) {
+    if (issue.path == null || issue.line == null) {
+        return undefined;
     }
-    const lines = diffLines[normalizePath(issue.path, analysisPath)];
-    return issueLines(issue.line, issue.eline).every((line) => lines?.[line] != null);
+    const commentPath = normalizePath(issue.path, analysisPath);
+    const lines = diffLines[commentPath];
+    const eline = issue.eline ?? issue.line;
+    const range = issueLines(issue.line, eline);
+    const added = range.find((line) => lines?.[line] ?? false);
+    if (added == null) {
+        return undefined;
+    }
+    if (range.every((line) => lines?.[line] != null)) {
+        return { path: commentPath, line: issue.line, eline, partial: false };
+    }
+    let start = added;
+    let end = added;
+    while (start > issue.line && lines?.[start - 1] != null) {
+        start--;
+    }
+    while (end < eline && lines?.[end + 1] != null) {
+        end++;
+    }
+    return { path: commentPath, line: start, eline: end, partial: true };
 }
 function filterNewIssues(issues, prDiff, analysisPath) {
     const diffLines = parseDiffLines(prDiff);
@@ -32309,7 +32342,7 @@ async function run() {
             if (prNumber == null) {
                 throw new Error('No pull request number found.');
             }
-            pullRequest ??= [prNumber, await (0, bugalint_1.getPrDiff)(githubToken, github_1.context.repo.owner, github_1.context.repo.repo, prNumber)];
+            pullRequest ??= [prNumber, await (0, bugalint_1.getPrDiff)(githubToken, github_1.context.repo.owner, github_1.context.repo.repo)];
             return pullRequest;
         };
         let issues = [...parser(input)];
